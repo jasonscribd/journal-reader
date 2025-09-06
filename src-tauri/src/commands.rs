@@ -153,6 +153,107 @@ pub async fn test_ai_connection(app_handle: tauri::AppHandle) -> Result<bool> {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GoogleOAuthStatus {
+    pub connected: bool,
+}
+
+#[tauri::command]
+pub async fn get_google_oauth_status(app_handle: tauri::AppHandle) -> Result<GoogleOAuthStatus> {
+    let settings = crate::database::get_settings(&app_handle).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_READ".into()) })?;
+    let mut has_token = false;
+    for (k, _) in settings {
+        if k == "google_access_token" { has_token = true; break; }
+    }
+    Ok(GoogleOAuthStatus { connected: has_token })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GoogleOAuthInit {
+    pub auth_url: String,
+    pub state: String,
+    pub code_verifier: String,
+}
+
+#[tauri::command]
+pub async fn google_oauth_start(app_handle: tauri::AppHandle) -> Result<GoogleOAuthInit> {
+    use rand::{distributions::Alphanumeric, Rng};
+    let settings = crate::database::get_settings(&app_handle).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_READ".into()) })?;
+    let mut client_id = String::new();
+    for (k, v) in settings {
+        if k == "google_client_id" { client_id = v; }
+    }
+    if client_id.is_empty() {
+        return Err(crate::AppError { message: "Missing Google Client ID in settings".into(), code: Some("GOOGLE_CLIENT_ID".into()) });
+    }
+
+    // PKCE code_verifier and challenge
+    let code_verifier: String = rand::thread_rng().sample_iter(&Alphanumeric).take(64).map(char::from).collect();
+    let sha = sha2::Sha256::digest(code_verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha);
+    let state: String = rand::thread_rng().sample_iter(&Alphanumeric).take(24).map(char::from).collect();
+
+    // Loopback redirect
+    let redirect_uri = "http://127.0.0.1:8765/callback";
+    let scope = urlencoding::encode("https://www.googleapis.com/auth/drive.readonly");
+    let auth_url = format!(
+        "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={}&redirect_uri={}&scope={}&access_type=offline&prompt=consent&code_challenge_method=S256&code_challenge={}&state={}",
+        urlencoding::encode(&client_id),
+        urlencoding::encode(redirect_uri),
+        scope,
+        challenge,
+        state
+    );
+
+    Ok(GoogleOAuthInit { auth_url, state, code_verifier })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GoogleOAuthCompleteRequest {
+    pub code: String,
+    pub state: String,
+    pub code_verifier: String,
+}
+
+#[tauri::command]
+pub async fn google_oauth_complete(app_handle: tauri::AppHandle, req: GoogleOAuthCompleteRequest) -> Result<bool> {
+    // Exchange code for tokens
+    let settings = crate::database::get_settings(&app_handle).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_READ".into()) })?;
+    let mut client_id = String::new();
+    for (k, v) in settings.clone() {
+        if k == "google_client_id" { client_id = v; }
+    }
+    if client_id.is_empty() {
+        return Err(crate::AppError { message: "Missing Google Client ID in settings".into(), code: Some("GOOGLE_CLIENT_ID".into()) });
+    }
+    let redirect_uri = "http://127.0.0.1:8765/callback";
+    let token_url = "https://oauth2.googleapis.com/token";
+    let client = reqwest::Client::new();
+    let params = [
+        ("grant_type", "authorization_code"),
+        ("code", req.code.as_str()),
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", req.code_verifier.as_str()),
+    ];
+    let resp = client.post(token_url).form(&params).send().await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("HTTP".into()) })?;
+    if !resp.status().is_success() {
+        return Err(crate::AppError { message: format!("Token exchange failed: {}", resp.status()), code: Some("TOKEN".into()) });
+    }
+    let json: serde_json::Value = resp.json().await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("JSON".into()) })?;
+    let access = json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let refresh = json.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if access.is_empty() {
+        return Ok(false);
+    }
+    // Store tokens
+    crate::database::update_setting(&app_handle, "google_access_token", &access).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_WRITE".into()) })?;
+    if !refresh.is_empty() {
+        let _ = crate::database::update_setting(&app_handle, "google_refresh_token", &refresh).await;
+    }
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn scan_import_files(_app_handle: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<FileImportItem>> {
     use crate::import::{parse_file, FileType};

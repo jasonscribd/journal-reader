@@ -32,4 +32,7 @@ walkdir = "2.5"
 zip = "0.6"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+base64 = "0.21"
+rand = "0.8"
+urlencoding = "2.1"
 

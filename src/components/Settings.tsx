@@ -39,6 +39,8 @@ export function Settings() {
   const [maxContextEntries, setMaxContextEntries] = useState(5);
   const [searchResultsLimit, setSearchResultsLimit] = useState(20);
   const [autoTagging, setAutoTagging] = useState(true);
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [googleConnected, setGoogleConnected] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -76,8 +78,15 @@ export function Settings() {
           case "auto_tagging":
             setAutoTagging(setting.value === "true");
             break;
+          case "google_client_id":
+            setGoogleClientId(setting.value);
+            break;
         }
       });
+      try {
+        const status = await invoke<{ connected: boolean }>("get_google_oauth_status");
+        setGoogleConnected(status.connected);
+      } catch {}
     } catch (error) {
       console.error("Failed to load settings:", error);
       setMessage({ type: 'error', text: 'Failed to load settings' });
@@ -99,6 +108,7 @@ export function Settings() {
       { key: "max_context_entries", value: maxContextEntries.toString() },
       { key: "search_results_limit", value: searchResultsLimit.toString() },
       { key: "auto_tagging", value: autoTagging.toString() },
+      { key: "google_client_id", value: googleClientId },
     ];
 
     try {
@@ -126,6 +136,21 @@ export function Settings() {
       setMessage(ok ? { type: 'success', text: 'Ollama reachable' } : { type: 'error', text: 'Ollama not reachable' });
     } catch (error) {
       setMessage({ type: 'error', text: 'Connection test failed' });
+    }
+  };
+
+  const connectGoogle = async () => {
+    try {
+      setMessage(null);
+      const init = await invoke<{ auth_url: string, state: string, code_verifier: string }>("google_oauth_start");
+      window.open(init.auth_url, "_blank");
+      const code = prompt("Authorize in your browser, then paste the 'code' parameter from the redirected URL:") || "";
+      if (!code) return;
+      const ok = await invoke<boolean>("google_oauth_complete", { req: { code, state: init.state, codeVerifier: init.code_verifier } });
+      setGoogleConnected(ok);
+      setMessage(ok ? { type: 'success', text: 'Google Drive connected!' } : { type: 'error', text: 'Failed to connect Google Drive' });
+    } catch (error) {
+      setMessage({ type: 'error', text: 'Google auth failed' });
     }
   };
 
@@ -239,6 +264,20 @@ export function Settings() {
                 onChange={(e) => setEmbeddingModel(e.target.value)}
                 placeholder="nomic-embed-text"
               />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="google-client-id">Google Client ID</Label>
+              <Input
+                id="google-client-id"
+                value={googleClientId}
+                onChange={(e) => setGoogleClientId(e.target.value)}
+                placeholder="your-client-id.apps.googleusercontent.com"
+              />
+              <div className="flex items-center gap-2">
+                <Button onClick={connectGoogle} size="sm" variant="outline">{googleConnected ? 'Reconnect Google Drive' : 'Connect Google Drive'}</Button>
+                {googleConnected && <span className="text-xs text-green-700">Connected</span>}
+              </div>
             </div>
           </div>
 

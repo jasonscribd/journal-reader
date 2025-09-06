@@ -51,6 +51,9 @@ pub fn run() {
             commands::search_entries_simple,
             commands::get_db_diagnostics,
             commands::test_ai_connection,
+            commands::get_google_oauth_status,
+            commands::google_oauth_start,
+            commands::google_oauth_complete,
             
         ])
         .setup(|app| {

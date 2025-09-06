@@ -154,20 +154,67 @@ pub async fn parse_docx_file(path: &str) -> Result<String> {
 // We import a placeholder entry containing the doc URL so it shows up in the timeline/search.
 // For full text, export from Google Docs to .docx or .txt and import that file.
 pub async fn parse_gdoc_file(path: &str) -> Result<String> {
+    use regex::Regex;
     let text = std::fs::read_to_string(path).context("Failed to read GDOC file")?;
     let json: serde_json::Value = serde_json::from_str(&text).context("Failed to parse GDOC JSON")?;
     let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let placeholder = if !url.is_empty() {
-        format!(
-            "Google Doc link: {}\n\nTitle: {}\n\nNote: Export the Google Doc as .docx or .txt and re-import to capture full text.",
+
+    // Try to extract Google Doc ID and fetch exported content
+    if let Some(u) = (!url.is_empty()).then(|| url) {
+        let re = Regex::new(r"https?://docs\.google\.com/document/d/([a-zA-Z0-9_-]+)").ok();
+        if let Some(re) = re {
+            if let Some(caps) = re.captures(u) {
+                let doc_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !doc_id.is_empty() {
+                    let base = format!("https://docs.google.com/document/d/{}", doc_id);
+                    // Try plain text export first
+                    let txt_url = format!("{}/export?format=txt", base);
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .unwrap();
+                    if let Ok(resp) = client.get(&txt_url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(body) = resp.text().await {
+                                let normalized = normalize_content(&body);
+                                if !normalized.is_empty() {
+                                    return Ok(normalized);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback to DOCX export and parse locally
+                    let docx_url = format!("{}/export?format=docx", base);
+                    if let Ok(resp) = client.get(&docx_url).send().await {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes().await {
+                                let tmp_path = std::env::temp_dir().join(format!("{}.docx", doc_id));
+                                if std::fs::write(&tmp_path, &bytes).is_ok() {
+                                    let content = parse_docx_file(tmp_path.to_string_lossy().as_ref()).await;
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    if let Ok(content) = content {
+                                        let normalized = normalize_content(&content);
+                                        if !normalized.is_empty() {
+                                            return Ok(normalized);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // If we reach here, return a helpful placeholder with URL
+        let placeholder = format!(
+            "Google Doc link: {}\n\nTitle: {}\n\nNote: Could not fetch content automatically. Export the Google Doc as .docx or .txt and re-import to capture full text.",
             url,
             name
-        )
-    } else {
-        "Google Doc placeholder. Note: Export the Google Doc as .docx or .txt and re-import to capture full text.".to_string()
-    };
-    Ok(placeholder)
+        );
+        return Ok(placeholder);
+    }
+    Ok("Google Doc placeholder. Note: Provide a valid Google Docs link or export as .docx/.txt for full text.".to_string())
 }
 
 // Basic DOCX text extraction using ZIP parsing

@@ -1,0 +1,18 @@
+# Node
+node_modules/
+*.log
+
+# Vite
+/dist/
+.vite/
+
+# Tauri / Rust
+src-tauri/target/
+**/*.dSYM/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App data (do not commit local DB)
+**/journal.db

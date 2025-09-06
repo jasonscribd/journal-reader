@@ -1,0 +1,159 @@
+// Journal Reader Prisma Schema
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./journal.db"
+}
+
+model Entry {
+  id             String   @id @default(cuid())
+  title          String?
+  body           String
+  entryDate      DateTime
+  entryTimezone  String   @default("UTC")
+  sourcePath     String
+  sourceType     String   // "txt" | "docx"
+  textHash       String   @unique
+  embedding      Bytes?   // float32 array stored as blob
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  sentiment      Float?
+  language       String?
+  
+  // Relations
+  tags           EntryTag[]
+  citations      Citation[]
+  
+  @@index([entryDate])
+  @@index([textHash])
+  @@index([sourcePath])
+}
+
+model Tag {
+  id          String @id @default(cuid())
+  name        String @unique
+  parentId    String?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relations
+  parent      Tag?       @relation("TagHierarchy", fields: [parentId], references: [id])
+  children    Tag[]      @relation("TagHierarchy")
+  aliases     Alias[]
+  entries     EntryTag[]
+}
+
+model Alias {
+  id        String @id @default(cuid())
+  tagId     String
+  aliasText String @unique
+  createdAt DateTime @default(now())
+  
+  // Relations
+  tag       Tag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+}
+
+model EntryTag {
+  id      String @id @default(cuid())
+  entryId String
+  tagId   String
+  
+  // Relations
+  entry   Entry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  tag     Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  
+  @@unique([entryId, tagId])
+}
+
+model ImportJob {
+  id         String   @id @default(cuid())
+  rootPath   String
+  status     String   // "pending" | "running" | "completed" | "failed"
+  totalFiles Int      @default(0)
+  processed  Int      @default(0)
+  succeeded  Int      @default(0)
+  failed     Int      @default(0)
+  errorLog   String?
+  startedAt  DateTime @default(now())
+  finishedAt DateTime?
+  
+  @@index([status])
+  @@index([startedAt])
+}
+
+model Conversation {
+  id           String   @id @default(cuid())
+  title        String
+  systemPrompt String?
+  provider     String   // "ollama" | "openai"
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  
+  // Relations
+  messages     Message[]
+}
+
+model Message {
+  id             String @id @default(cuid())
+  conversationId String
+  role           String // "user" | "assistant" | "system"
+  content        String
+  createdAt      DateTime @default(now())
+  
+  // Relations
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  citations      Citation[]
+  
+  @@index([conversationId])
+}
+
+model Citation {
+  id        String @id @default(cuid())
+  messageId String
+  entryId   String
+  span      String? // text span that was cited
+  
+  // Relations
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  entry     Entry   @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  
+  @@index([messageId])
+  @@index([entryId])
+}
+
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // Relations
+  audits    SettingAudit[]
+}
+
+model SettingAudit {
+  id        String   @id @default(cuid())
+  settingId String
+  oldValue  String?
+  newValue  String
+  changedAt DateTime @default(now())
+  
+  // Relations
+  setting   Setting @relation(fields: [settingId], references: [id], onDelete: Cascade)
+  
+  @@index([settingId])
+  @@index([changedAt])
+}
+
+model IndexState {
+  id             String   @id @default(cuid())
+  embeddingModel String
+  version        String
+  lastBuild      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}

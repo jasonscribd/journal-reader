@@ -1,0 +1,35 @@
+[package]
+name = "journal-reader"
+version = "0.1.0"
+description = "A local-first journal reader with AI-powered search and organization"
+authors = ["Jason B"]
+edition = "2021"
+
+[lib]
+name = "journal_reader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2.5"
+tauri-plugin-sql = { version = "2.3", features = ["sqlite"] }
+tauri-plugin-fs = "2.4"
+tauri-plugin-dialog = "2.3"
+tauri-plugin-shell = "2.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+reqwest = { version = "0.11", features = ["json"] }
+walkdir = "2.5"
+zip = "0.6"
+regex = "1"
+rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+

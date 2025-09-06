@@ -1,0 +1,400 @@
+use crate::Result;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Setting {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportRequest {
+    pub paths: Vec<String>,
+    pub default_date: Option<String>,
+    pub bulk_date_mode: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileImportItem {
+    pub path: String,
+    pub title: Option<String>,
+    pub size_bytes: u64,
+    pub file_type: String,
+    pub suggested_date: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportResult {
+    pub imported: u32,
+    pub failed: u32,
+    pub errors: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FileWithDate {
+    pub path: String,
+    pub entry_date: String,
+    pub entry_timezone: String,
+}
+
+// Removed search types in simplified app
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TimelineData {
+    pub years: Vec<YearData>,
+    pub total_entries: u32,
+    pub date_range: Option<(String, String)>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct YearData {
+    pub year: i32,
+    pub total_count: u32,
+    pub months: Vec<MonthData>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MonthData {
+    pub month: u32,
+    pub month_name: String,
+    pub count: u32,
+    pub entries: Vec<EntryPreview>,
+}
+
+// Simplified timeline: provided via year/month counts and list entries per month
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntryPreview {
+    pub id: String,
+    pub title: Option<String>,
+    pub preview: String,
+    pub entry_date: String,
+    pub tags: Vec<String>,
+}
+#[tauri::command]
+pub async fn search_entries_simple(app_handle: tauri::AppHandle, query: String, limit: Option<u32>) -> Result<Vec<EntryPreview>> {
+    use tokio::time::{timeout, Duration};
+    let lim = limit.unwrap_or(50);
+    let trimmed = query.trim().to_string();
+
+    println!("[search] start query='{}' limit={}", trimmed, lim);
+    let started = std::time::Instant::now();
+
+    let fut = crate::database::search_entries_fts_simple(&app_handle, &trimmed, lim);
+    let timed = timeout(Duration::from_secs(10), fut).await;
+
+    let results = match timed {
+        Ok(inner) => inner.map_err(|e| crate::AppError { message: format!("Search error: {}", e), code: Some("SEARCH_ERROR".into()) })?,
+        Err(_) => {
+            println!("[search] timeout query='{}'", trimmed);
+            return Err(crate::AppError { message: "Search timed out".into(), code: Some("TIMEOUT".into()) });
+        }
+    };
+
+    let elapsed = started.elapsed().as_millis();
+    println!("[search] done query='{}' ms={} results={}", trimmed, elapsed, results.len());
+
+    Ok(results.into_iter().map(|(e, snip)| EntryPreview {
+        id: e.id,
+        title: e.title,
+        preview: if snip.is_empty() { create_preview(&e.body, 240) } else { snip },
+        entry_date: e.entry_date.to_rfc3339(),
+        tags: vec![],
+    }).collect())
+}
+
+// Removed chat request in simplified app
+
+#[tauri::command]
+pub async fn greet(name: &str) -> Result<String> {
+    Ok(format!("Hello, {}! Welcome to Journal Reader!", name))
+}
+
+#[tauri::command]
+pub async fn init_database(app_handle: tauri::AppHandle) -> Result<()> {
+    crate::database::init_database(&app_handle).await?;
+    // Backfill FTS on startup
+    if let Err(e) = crate::database::ensure_fts_populated(&app_handle).await {
+        eprintln!("[fts] backfill error: {}", e);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_settings(app_handle: tauri::AppHandle) -> Result<Vec<Setting>> {
+    let items = crate::database::get_settings(&app_handle).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_READ".into()) })?;
+    Ok(items.into_iter().map(|(key, value)| Setting { key, value }).collect())
+}
+
+#[tauri::command]
+pub async fn update_setting(app_handle: tauri::AppHandle, key: String, value: String) -> Result<()> {
+    crate::database::update_setting(&app_handle, &key, &value).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_WRITE".into()) })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn test_ai_connection(app_handle: tauri::AppHandle) -> Result<bool> {
+    use std::time::Duration;
+    let settings = crate::database::get_settings(&app_handle).await.map_err(|e| crate::AppError { message: e.to_string(), code: Some("SETTINGS_READ".into()) })?;
+    let mut provider = "ollama".to_string();
+    let mut ollama_url = "http://localhost:11434".to_string();
+    for (k, v) in settings {
+        if k == "ai_provider" { provider = v; }
+        if k == "ollama_url" { ollama_url = v; }
+    }
+
+    if provider != "ollama" { return Ok(false); }
+
+    let url = format!("{}/api/tags", ollama_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().map_err(|e| crate::AppError { message: e.to_string(), code: Some("HTTP".into()) })?;
+    match client.get(url).send().await {
+        Ok(resp) => Ok(resp.status().is_success() || resp.status().as_u16() == 404),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+pub async fn scan_import_files(_app_handle: tauri::AppHandle, paths: Vec<String>) -> Result<Vec<FileImportItem>> {
+    use crate::import::{parse_file, FileType};
+    use std::path::Path;
+    use walkdir::WalkDir;
+    
+    let mut files = Vec::new();
+    
+    for path_str in paths {
+        let path = Path::new(&path_str);
+        
+        if path.is_file() {
+            // Single file
+            if let Ok(parsed) = parse_file(&path_str).await {
+                files.push(FileImportItem {
+                    path: path_str,
+                    title: parsed.title,
+                    size_bytes: parsed.size_bytes,
+                    file_type: parsed.file_type.as_str().to_string(),
+                    suggested_date: None, // We'll let the user specify dates
+                });
+            }
+        } else if path.is_dir() {
+            // Directory - walk recursively
+            for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+                let entry_path = entry.path();
+                if entry_path.is_file() {
+                    if let Some(ext) = entry_path.extension().and_then(|e| e.to_str()) {
+                        if FileType::from_extension(ext).is_some() {
+                            let path_str = entry_path.to_string_lossy().to_string();
+                            if let Ok(parsed) = parse_file(&path_str).await {
+                                files.push(FileImportItem {
+                                    path: path_str,
+                                    title: parsed.title,
+                                    size_bytes: parsed.size_bytes,
+                                    file_type: parsed.file_type.as_str().to_string(),
+                                    suggested_date: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(files)
+}
+
+#[tauri::command]
+pub async fn import_files_with_dates(
+    app_handle: tauri::AppHandle, 
+    files: Vec<FileWithDate>
+) -> Result<ImportResult> {
+    // use chrono::{DateTime, Utc};
+    let mut imported = 0u32;
+    let mut failed = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+
+    for file in files {
+        match process_single_file(&app_handle, file).await {
+            Ok(_) => imported += 1,
+                Err(e) => {
+                    failed += 1;
+                errors.push(e.message);
+            }
+        }
+    }
+
+    Ok(ImportResult { imported, failed, errors: if errors.is_empty() { None } else { Some(errors) } })
+}
+
+async fn process_single_file(
+    app_handle: &tauri::AppHandle,
+    file_with_date: FileWithDate,
+) -> Result<String> {
+    use crate::import::{parse_file, normalize_content};
+    use crate::database::{save_entry, check_duplicate};
+    use chrono::{DateTime, Utc};
+    
+    // Parse the file
+    let mut parsed_file = parse_file(&file_with_date.path).await
+        .map_err(|e| crate::AppError { 
+            message: format!("Failed to parse file: {}", e), 
+            code: Some("PARSE_ERROR".to_string()) 
+        })?;
+    
+    // Normalize content
+    parsed_file.content = normalize_content(&parsed_file.content);
+    
+    // Check for duplicates
+    if let Some(existing_id) = check_duplicate(app_handle, &parsed_file.text_hash).await? {
+        return Err(crate::AppError {
+            message: format!("Duplicate content found (existing entry: {})", existing_id),
+            code: Some("DUPLICATE".to_string()),
+        });
+    }
+    
+    // Parse the entry date
+    let entry_date = DateTime::parse_from_rfc3339(&file_with_date.entry_date)
+        .map_err(|e| crate::AppError {
+            message: format!("Invalid date format: {}", e),
+            code: Some("INVALID_DATE".to_string()),
+        })?
+        .with_timezone(&Utc);
+    
+    // Save to database
+    let entry_id = save_entry(
+        app_handle,
+        parsed_file,
+        entry_date,
+        file_with_date.entry_timezone,
+    ).await?;
+    
+    Ok(entry_id)
+}
+
+// Removed: background import job status
+
+// Removed: complex search; may reintroduce later if needed
+
+#[tauri::command]
+pub async fn get_available_years(app_handle: tauri::AppHandle) -> Result<Vec<i32>> {
+    let years = crate::database::get_available_years(&app_handle).await?;
+    Ok(years)
+}
+
+#[tauri::command]
+pub async fn get_month_counts_for_year(app_handle: tauri::AppHandle, year: i32) -> Result<Vec<crate::database::MonthCount>> {
+    let months = crate::database::get_month_counts_for_year(&app_handle, year).await?;
+    Ok(months)
+}
+
+#[tauri::command]
+pub async fn list_entries_for_month(app_handle: tauri::AppHandle, year: i32, month: u32) -> Result<Vec<EntryPreview>> {
+    let entries = crate::database::list_entries_by_month(&app_handle, year, month).await?;
+    let previews: Vec<EntryPreview> = entries.into_iter().map(|e| EntryPreview {
+        id: e.id,
+        title: e.title,
+        preview: create_preview(&e.body, 200),
+        entry_date: e.entry_date.to_rfc3339(),
+        tags: vec![],
+    }).collect();
+    Ok(previews)
+}
+
+// Removed calendar heatmap for simplified UI
+
+// Removed day view for simplified UI
+
+fn create_preview(text: &str, max_len: usize) -> String {
+    let mut s = text.trim().replace('\n', " ");
+    if s.len() > max_len { s.truncate(max_len); s.push_str("..."); }
+    s
+}
+
+// Helper function to get month name
+fn get_month_name(month: u32) -> String {
+    match month {
+        1 => "January",
+        2 => "February", 
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "Unknown",
+    }.to_string()
+}
+
+#[tauri::command]
+pub async fn get_entry_by_id(app_handle: tauri::AppHandle, id: String) -> Result<Option<EntryPreview>> {
+    if let Some(e) = crate::database::get_entry_by_id(&app_handle, &id).await? {
+        Ok(Some(EntryPreview {
+            id: e.id,
+            title: e.title,
+            preview: e.body,
+            entry_date: e.entry_date.to_rfc3339(),
+            tags: vec![],
+        }))
+    } else {
+    Ok(None)
+}
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DbDiagnostics {
+    pub db_path: String,
+    pub total_entries: u32,
+    pub years: Vec<i32>,
+}
+
+#[tauri::command]
+pub async fn get_db_diagnostics(app_handle: tauri::AppHandle) -> Result<DbDiagnostics> {
+    let info = crate::database::get_db_info(&app_handle).await.map_err(|e| crate::AppError { message: format!("DB info error: {}", e), code: Some("DB_INFO".into()) })?;
+    println!("[db] path={} total_entries={}", info.db_path, info.total_entries);
+    Ok(DbDiagnostics { db_path: info.db_path, total_entries: info.total_entries, years: info.years })
+}
+
+// Removed AI/tagging-related commands in simplified app
+
+// --
+
+// --
+
+// --
+
+// --
+
+// --
+
+// --
+
+// --
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TagStatistic {
+    pub tag: String,
+    pub count: u32,
+    pub percentage: f32,
+    pub recent_usage: String,
+}
+
+// --
+
+// Removed AI chat in simplified app
+
+// --
+
+// --
+
+// --
+
+// --
+
+// --
+
+// --
+
+

@@ -39,6 +39,7 @@ pub struct ParsedFile {
 pub enum FileType {
     Txt,
     Docx,
+    GDoc,
 }
 
 impl FileType {
@@ -46,6 +47,7 @@ impl FileType {
         match ext.to_lowercase().as_str() {
             "txt" => Some(FileType::Txt),
             "doc" | "docx" => Some(FileType::Docx),
+            "gdoc" => Some(FileType::GDoc),
             _ => None,
         }
     }
@@ -54,6 +56,7 @@ impl FileType {
         match self {
             FileType::Txt => "txt",
             FileType::Docx => "docx",
+            FileType::GDoc => "gdoc",
         }
     }
 }
@@ -75,6 +78,7 @@ pub async fn parse_file(file_path: &str) -> Result<ParsedFile> {
     let content = match file_type {
         FileType::Txt => parse_txt_file(file_path).await?,
         FileType::Docx => parse_docx_file(file_path).await?,
+        FileType::GDoc => parse_gdoc_file(file_path).await?,
     };
     
     // Generate content hash for deduplication
@@ -144,6 +148,26 @@ pub async fn parse_docx_file(path: &str) -> Result<String> {
             ))
         }
     }
+}
+
+// Parse Google Docs link files (.gdoc). These are small JSON files pointing to the web URL.
+// We import a placeholder entry containing the doc URL so it shows up in the timeline/search.
+// For full text, export from Google Docs to .docx or .txt and import that file.
+pub async fn parse_gdoc_file(path: &str) -> Result<String> {
+    let text = std::fs::read_to_string(path).context("Failed to read GDOC file")?;
+    let json: serde_json::Value = serde_json::from_str(&text).context("Failed to parse GDOC JSON")?;
+    let url = json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let placeholder = if !url.is_empty() {
+        format!(
+            "Google Doc link: {}\n\nTitle: {}\n\nNote: Export the Google Doc as .docx or .txt and re-import to capture full text.",
+            url,
+            name
+        )
+    } else {
+        "Google Doc placeholder. Note: Export the Google Doc as .docx or .txt and re-import to capture full text.".to_string()
+    };
+    Ok(placeholder)
 }
 
 // Basic DOCX text extraction using ZIP parsing

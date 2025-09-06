@@ -67,7 +67,7 @@ export function Import() {
         filters: [
           {
             name: "Journal Files",
-            extensions: ["txt", "doc", "docx"]
+            extensions: ["txt", "doc", "docx", "gdoc"]
           }
         ]
       });

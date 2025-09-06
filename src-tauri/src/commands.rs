@@ -140,7 +140,7 @@ pub async fn test_ai_connection(app_handle: tauri::AppHandle) -> Result<bool> {
     let mut ollama_url = "http://localhost:11434".to_string();
     for (k, v) in settings {
         if k == "ai_provider" { provider = v; }
-        if k == "ollama_url" { ollama_url = v; }
+        else if k == "ollama_url" { ollama_url = v; }
     }
 
     if provider != "ollama" { return Ok(false); }

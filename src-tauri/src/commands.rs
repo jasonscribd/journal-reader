@@ -1,6 +1,7 @@
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
+use base64::Engine;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Setting {
@@ -342,9 +343,13 @@ pub async fn google_import_doc_by_file_id(app_handle: tauri::AppHandle, req: Imp
 
     // Optionally fetch file name for title
     let meta_url = format!("{}?fields=name", base);
-    let title = client.get(&meta_url).bearer_auth(&access).send().await.ok()
-        .and_then(|r| r.json::<serde_json::Value>().ok())
-        .and_then(|j| j.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()));
+    let title = match client.get(&meta_url).bearer_auth(&access).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(j) => j.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
 
     // Build ParsedFile
     let mut hasher = Sha256::new();

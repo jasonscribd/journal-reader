@@ -1,5 +1,6 @@
 use crate::Result;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Setting {
@@ -252,6 +253,120 @@ pub async fn google_oauth_complete(app_handle: tauri::AppHandle, req: GoogleOAut
         let _ = crate::database::update_setting(&app_handle, "google_refresh_token", &refresh).await;
     }
     Ok(true)
+}
+
+async fn google_get_valid_access_token(app_handle: &tauri::AppHandle) -> std::result::Result<String, anyhow::Error> {
+    let settings = crate::database::get_settings(app_handle).await?;
+    let mut client_id = String::new();
+    let mut access = String::new();
+    let mut refresh = String::new();
+    for (k, v) in settings {
+        if k == "google_client_id" { client_id = v; }
+        else if k == "google_access_token" { access = v; }
+        else if k == "google_refresh_token" { refresh = v; }
+    }
+    if access.is_empty() && refresh.is_empty() { return Err(anyhow::anyhow!("No Google tokens")); }
+    // Try a lightweight call to validate access token
+    if !access.is_empty() {
+        let resp = reqwest::Client::new()
+            .get("https://www.googleapis.com/drive/v3/about?fields=user")
+            .bearer_auth(&access)
+            .send().await;
+        if let Ok(r) = resp { if r.status().is_success() { return Ok(access); } }
+    }
+    // Refresh
+    if !refresh.is_empty() && !client_id.is_empty() {
+        let params = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+            ("client_id", client_id.as_str()),
+        ];
+        let token_url = "https://oauth2.googleapis.com/token";
+        let resp = reqwest::Client::new().post(token_url).form(&params).send().await?;
+        if !resp.status().is_success() { return Err(anyhow::anyhow!("Refresh failed: {}", resp.status())); }
+        let json: serde_json::Value = resp.json().await?;
+        let new_access = json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if new_access.is_empty() { return Err(anyhow::anyhow!("No access_token in refresh response")); }
+        // Persist
+        let _ = crate::database::update_setting(app_handle, "google_access_token", &new_access).await;
+        return Ok(new_access);
+    }
+    Err(anyhow::anyhow!("No valid Google token"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImportGDocByIdRequest {
+    pub file_id: String,
+    pub entry_date: String,       // RFC3339
+    pub entry_timezone: String,   // e.g., "UTC"
+}
+
+#[tauri::command]
+pub async fn google_import_doc_by_file_id(app_handle: tauri::AppHandle, req: ImportGDocByIdRequest) -> Result<String> {
+    use chrono::{DateTime, Utc};
+    use crate::import::{ParsedFile, FileType, normalize_content};
+    use sha2::Sha256;
+
+    let access = google_get_valid_access_token(&app_handle).await
+        .map_err(|e| crate::AppError { message: format!("Google token error: {}", e), code: Some("GOOGLE_TOKEN".into()) })?;
+
+    // Try text export first
+    let base = format!("https://www.googleapis.com/drive/v3/files/{}", req.file_id);
+    let txt_url = format!("{}/export?mimeType=text/plain", base);
+    let client = reqwest::Client::new();
+    let mut content = String::new();
+    let resp = client.get(&txt_url).bearer_auth(&access).send().await
+        .map_err(|e| crate::AppError { message: e.to_string(), code: Some("HTTP".into()) })?;
+    if resp.status().is_success() {
+        content = resp.text().await.unwrap_or_default();
+    } else {
+        // Fallback to docx export
+        let docx_url = format!("{}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document", base);
+        let resp2 = client.get(&docx_url).bearer_auth(&access).send().await
+            .map_err(|e| crate::AppError { message: e.to_string(), code: Some("HTTP".into()) })?;
+        if resp2.status().is_success() {
+            let bytes = resp2.bytes().await.unwrap_or_default();
+            let tmp = std::env::temp_dir().join(format!("{}.docx", req.file_id));
+            let _ = std::fs::write(&tmp, &bytes);
+            if let Ok(text) = crate::import::parse_docx_file(tmp.to_string_lossy().as_ref()).await {
+                content = text;
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    if content.trim().is_empty() {
+        return Err(crate::AppError { message: "Failed to export Google Doc content".into(), code: Some("GDRIVE_EXPORT".into()) });
+    }
+
+    let content = normalize_content(&content);
+
+    // Optionally fetch file name for title
+    let meta_url = format!("{}?fields=name", base);
+    let title = client.get(&meta_url).bearer_auth(&access).send().await.ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|j| j.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+    // Build ParsedFile
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let text_hash = format!("{:x}", hasher.finalize());
+    let parsed = ParsedFile {
+        path: format!("gdrive:{}", req.file_id),
+        content: content.clone(),
+        title,
+        file_type: FileType::Txt,
+        text_hash,
+        size_bytes: content.len() as u64,
+    };
+
+    // Parse date
+    let entry_date = DateTime::parse_from_rfc3339(&req.entry_date)
+        .map_err(|e| crate::AppError { message: format!("Invalid date: {}", e), code: Some("DATE".into()) })?
+        .with_timezone(&Utc);
+
+    let id = crate::database::save_entry(&app_handle, parsed, entry_date, req.entry_timezone).await
+        .map_err(|e| crate::AppError { message: e.to_string(), code: Some("SAVE".into()) })?;
+    Ok(id)
 }
 
 #[tauri::command]

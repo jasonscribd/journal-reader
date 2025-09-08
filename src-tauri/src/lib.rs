@@ -54,6 +54,7 @@ pub fn run() {
             commands::get_google_oauth_status,
             commands::google_oauth_start,
             commands::google_oauth_complete,
+            commands::google_import_doc_by_file_id,
             
         ])
         .setup(|app| {
